@@ -1,0 +1,482 @@
+<form version="1.1" theme="dark" refresh="300">
+  <label>DM_Net - Adversary IP Tracker</label>
+  <description>Enter an adversary IP to see everything it has done on the network across all Zeek logs. Click one of the hosts it talked to (peer column / bars) to pivot tracking to that host and follow lateral movement. Click a uid to open every Zeek log line for that connection.</description>
+
+  <init>
+    <!-- Labels the "peer" field (the host on the other side from the adversary).
+         Used as  | eval nets=mvappend("192.0.2.0/32=unused", split($nets|s$, ",")) | $peerlabel$ -->
+    <set token="peerlabel">eval peer_net=mvindex(mvmap(nets, if(cidrmatch(trim(mvindex(split(nets, "="), 0)), peer), coalesce(trim(mvindex(split(nets, "="), 1)), "internal"), null())), 0)
+| eval peer=if(isnotnull(peer_net), peer." (".peer_net.")", peer." (external)")
+| fields - nets peer_net</set>
+    <set token="range_label">Last 7 days</set>
+  </init>
+
+  <!-- One-row summary used by the headline numbers -->
+  <search id="summary">
+    <query>index=zeek TERM($ip$)
+| eval is_conn=if(sourcetype="bro:conn:json" AND ('id.orig_h'=$ip|s$ OR 'id.resp_h'=$ip|s$), 1, 0)
+| eval adv_orig=if('id.orig_h'=$ip|s$, 1, 0), peer=if(adv_orig=1, 'id.resp_h', 'id.orig_h')
+| eval to_adv=if(is_conn=1, if(adv_orig=1, resp_bytes, orig_bytes), null()), from_adv=if(is_conn=1, if(adv_orig=1, orig_bytes, resp_bytes), null())
+| stats min(_time) AS first_seen max(_time) AS last_seen sum(is_conn) AS conns dc(eval(if(is_conn=1, peer, null()))) AS peers sum(to_adv) AS to_adv sum(from_adv) AS from_adv dc(sourcetype) AS log_types
+| eval first_seen=if(isnull(first_seen), "never", strftime(first_seen, "%Y-%m-%d %H:%M:%S")),
+       last_seen=if(isnull(last_seen), "never", strftime(last_seen, "%Y-%m-%d %H:%M:%S")),
+       MB_to_adv=round(coalesce(to_adv, 0)/1048576, 2),
+       MB_from_adv=round(coalesce(from_adv, 0)/1048576, 2)</query>
+    <earliest>$range$</earliest>
+    <latest>now</latest>
+  </search>
+
+  <fieldset submitButton="false" autoRun="true">
+    <input type="text" token="ip" searchWhenChanged="true">
+      <label>Adversary IP</label>
+    </input>
+    <input type="dropdown" token="range" searchWhenChanged="true">
+      <label>Time range</label>
+      <choice value="-1h">Last hour</choice>
+      <choice value="-4h">Last 4 hours</choice>
+      <choice value="-24h">Last 24 hours</choice>
+      <choice value="-7d">Last 7 days</choice>
+      <choice value="-30d">Last 30 days</choice>
+      <choice value="0">All time</choice>
+      <default>-7d</default>
+      <change>
+        <set token="range_label">$label$</set>
+      </change>
+    </input>
+    <input type="text" token="nets" searchWhenChanged="true">
+      <label>Internal networks (CIDR=label, comma-separated)</label>
+      <default>172.16.1.0/24=NET-1, 172.16.2.0/24=NET-2, 172.16.3.0/24=NET-3, 172.16.4.0/24=NET-4, 172.16.5.0/24=NET-5, 172.16.9.0/24=NET-9</default>
+    </input>
+  </fieldset>
+
+  <!-- ============================== HEADLINE ============================== -->
+  <row>
+    <panel>
+      <title>First seen ($range_label$)</title>
+      <single>
+        <search base="summary"><query>fields first_seen</query></search>
+        <option name="underLabel">earliest Zeek log mentioning $ip$</option>
+        <option name="drilldown">none</option>
+        <option name="refresh.display">progressbar</option>
+      </single>
+    </panel>
+    <panel>
+      <title>Last seen ($range_label$)</title>
+      <single>
+        <search base="summary"><query>fields last_seen</query></search>
+        <option name="underLabel">latest Zeek log mentioning $ip$</option>
+        <option name="drilldown">none</option>
+        <option name="refresh.display">progressbar</option>
+      </single>
+    </panel>
+    <panel>
+      <title>Connections to/from $ip$</title>
+      <single>
+        <search base="summary"><query>fields conns</query></search>
+        <option name="underLabel">in conn.log, both directions</option>
+        <option name="drilldown">none</option>
+        <option name="refresh.display">progressbar</option>
+      </single>
+    </panel>
+    <panel>
+      <title>Hosts $ip$ communicated with</title>
+      <single>
+        <search base="summary"><query>fields peers</query></search>
+        <option name="underLabel">distinct IPs, internal + external</option>
+        <option name="drilldown">none</option>
+        <option name="refresh.display">progressbar</option>
+      </single>
+    </panel>
+    <panel>
+      <title>Data sent TO $ip$ (possible exfil)</title>
+      <single>
+        <search base="summary"><query>fields MB_to_adv</query></search>
+        <option name="unit">MB</option>
+        <option name="underLabel">red when over 1 MB</option>
+        <option name="useColors">1</option>
+        <option name="colorMode">block</option>
+        <option name="rangeValues">[1]</option>
+        <option name="rangeColors">["0x53a051","0xdc4e41"]</option>
+        <option name="drilldown">none</option>
+        <option name="refresh.display">progressbar</option>
+      </single>
+    </panel>
+    <panel>
+      <title>Data received FROM $ip$ (tools / payloads)</title>
+      <single>
+        <search base="summary"><query>fields MB_from_adv</query></search>
+        <option name="unit">MB</option>
+        <option name="underLabel">red when over 1 MB</option>
+        <option name="useColors">1</option>
+        <option name="colorMode">block</option>
+        <option name="rangeValues">[1]</option>
+        <option name="rangeColors">["0x53a051","0xdc4e41"]</option>
+        <option name="drilldown">none</option>
+        <option name="refresh.display">progressbar</option>
+      </single>
+    </panel>
+  </row>
+
+  <!-- ============================== TIMELINE ============================== -->
+  <row>
+    <panel>
+      <title>Activity over time: Zeek log entries mentioning $ip$, by log type - $range_label$</title>
+      <html>
+        <p style="margin:0; font-size:12px; color:#9ea3a8;">Shows what kind of activity happened when: conn = any connection, dns, http, ssl, ssh, smb, rdp, files etc.</p>
+      </html>
+      <chart>
+        <search>
+          <query>index=zeek TERM($ip$)
+| eval log=replace(sourcetype, "^bro:(.*):json$$", "\1")
+| timechart count BY log limit=10 useother=true</query>
+          <earliest>$range$</earliest>
+          <latest>now</latest>
+        </search>
+        <option name="charting.chart">column</option>
+        <option name="charting.chart.stackMode">stacked</option>
+        <option name="charting.axisTitleX.visibility">collapsed</option>
+        <option name="charting.axisTitleY.text">log entries</option>
+        <option name="charting.legend.placement">bottom</option>
+        <option name="charting.drilldown">none</option>
+        <option name="refresh.display">progressbar</option>
+      </chart>
+    </panel>
+    <panel>
+      <title>Connections over time: started by $ip$ vs started by the other side - $range_label$</title>
+      <html>
+        <p style="margin:0; font-size:12px; color:#9ea3a8;">"Started by adversary" = $ip$ reached out (scanning, exploitation, lateral movement). "Started by peer" = something connected to $ip$ (C2 callbacks, downloads).</p>
+      </html>
+      <chart>
+        <search>
+          <query>index=zeek sourcetype="bro:conn:json" TERM($ip$) (id.orig_h=$ip|s$ OR id.resp_h=$ip|s$)
+| eval started_by=if('id.orig_h'=$ip|s$, "Started by adversary", "Started by peer")
+| timechart count BY started_by</query>
+          <earliest>$range$</earliest>
+          <latest>now</latest>
+        </search>
+        <option name="charting.chart">column</option>
+        <option name="charting.chart.stackMode">stacked</option>
+        <option name="charting.axisTitleX.visibility">collapsed</option>
+        <option name="charting.axisTitleY.text">connections</option>
+        <option name="charting.legend.placement">bottom</option>
+        <option name="charting.drilldown">none</option>
+        <option name="refresh.display">progressbar</option>
+      </chart>
+    </panel>
+  </row>
+
+  <!-- ============================== WHO & WHAT ============================== -->
+  <row>
+    <panel>
+      <title>Hosts $ip$ communicated with, busiest first - $range_label$</title>
+      <html>
+        <p style="margin:0; font-size:12px; color:#9ea3a8;">established = connection actually completed a handshake; failed = no reply / rejected. MB columns are from the adversary's point of view. Click a peer to pivot tracking to it.</p>
+      </html>
+      <table>
+        <search>
+          <query>index=zeek sourcetype="bro:conn:json" TERM($ip$) (id.orig_h=$ip|s$ OR id.resp_h=$ip|s$)
+| eval adv_orig=if('id.orig_h'=$ip|s$, 1, 0), peer=if(adv_orig=1, 'id.resp_h', 'id.orig_h'), started_by=if(adv_orig=1, "adversary", "peer")
+| eval established=if(in(conn_state, "SF", "S1", "S2", "S3", "RSTO", "RSTR"), 1, 0)
+| eval to_adv=if(adv_orig=1, resp_bytes, orig_bytes), from_adv=if(adv_orig=1, orig_bytes, resp_bytes)
+| eval nets=mvappend("192.0.2.0/32=unused", split($nets|s$, ","))
+| $peerlabel$
+| stats count AS conns sum(established) AS established values(started_by) AS started_by values(id.resp_p) AS ports values(service) AS services sum(to_adv) AS to_adv sum(from_adv) AS from_adv min(_time) AS first_seen max(_time) AS last_seen BY peer
+| eval failed=conns-established,
+       ports=if(mvcount(ports) &gt; 10, mvcount(ports)." ports", mvjoin(ports, ", ")),
+       MB_to_adv=round(coalesce(to_adv, 0)/1048576, 2), MB_from_adv=round(coalesce(from_adv, 0)/1048576, 2),
+       first_seen=strftime(first_seen, "%Y-%m-%d %H:%M:%S"), last_seen=strftime(last_seen, "%Y-%m-%d %H:%M:%S")
+| sort - conns
+| table peer started_by conns established failed ports services MB_to_adv MB_from_adv first_seen last_seen</query>
+          <earliest>$range$</earliest>
+          <latest>now</latest>
+        </search>
+        <option name="count">10</option>
+        <option name="wrap">true</option>
+        <option name="drilldown">cell</option>
+        <option name="refresh.display">progressbar</option>
+        <format type="color" field="established">
+          <colorPalette type="minMidMax" minColor="#31373E" maxColor="#DC4E41"></colorPalette>
+          <scale type="minMidMax"></scale>
+        </format>
+        <drilldown>
+          <condition field="peer"><eval token="form.ip">replace($click.value2|s$, " .*", "")</eval></condition>
+        </drilldown>
+      </table>
+    </panel>
+    <panel>
+      <title>Ports &amp; protocols involved with $ip$ - $range_label$</title>
+      <html>
+        <p style="margin:0; font-size:12px; color:#9ea3a8;">dport = the port on the side that was connected to. service = protocol Zeek actually detected (blank = unrecognised). Many hosts + many failures on one port = scanning or brute force.</p>
+      </html>
+      <table>
+        <search>
+          <query>index=zeek sourcetype="bro:conn:json" TERM($ip$) (id.orig_h=$ip|s$ OR id.resp_h=$ip|s$)
+| eval adv_orig=if('id.orig_h'=$ip|s$, 1, 0), peer=if(adv_orig=1, 'id.resp_h', 'id.orig_h'), started_by=if(adv_orig=1, "adversary", "peer")
+| eval established=if(in(conn_state, "SF", "S1", "S2", "S3", "RSTO", "RSTR"), 1, 0)
+| rename id.resp_p AS dport
+| fillnull value="-" service
+| stats count AS conns sum(established) AS established dc(peer) AS hosts values(service) AS service values(started_by) AS started_by BY proto dport
+| eval failed=conns-established
+| sort - conns
+| table proto dport service started_by hosts conns established failed</query>
+          <earliest>$range$</earliest>
+          <latest>now</latest>
+        </search>
+        <option name="count">10</option>
+        <option name="wrap">true</option>
+        <option name="drilldown">none</option>
+        <option name="refresh.display">progressbar</option>
+        <format type="color" field="failed">
+          <colorPalette type="minMidMax" minColor="#31373E" maxColor="#DC4E41"></colorPalette>
+          <scale type="minMidMax"></scale>
+        </format>
+      </table>
+    </panel>
+    <panel>
+      <title>How connections with $ip$ ended - $range_label$</title>
+      <html>
+        <p style="margin:0; font-size:12px; color:#9ea3a8;">Lots of "no reply" / "rejected" = scanning. "Completed normally" = real sessions.</p>
+      </html>
+      <chart>
+        <search>
+          <query>index=zeek sourcetype="bro:conn:json" TERM($ip$) (id.orig_h=$ip|s$ OR id.resp_h=$ip|s$)
+| eval outcome=case(
+    conn_state="SF", "Completed normally",
+    conn_state="S0", "Attempt, no reply",
+    conn_state="REJ", "Rejected",
+    conn_state="S1", "Established, still open",
+    in(conn_state, "S2", "S3"), "Established, half-closed",
+    conn_state="RSTO", "Established, reset by initiator",
+    conn_state="RSTR", "Established, reset by responder",
+    in(conn_state, "RSTOS0", "SH"), "Initiator gave up / probe",
+    in(conn_state, "RSTRH", "SHR"), "Responder reset before handshake",
+    conn_state="OTH", "Mid-stream (no handshake seen)",
+    true(), coalesce(conn_state, "unknown"))
+| stats count BY outcome
+| sort - count</query>
+          <earliest>$range$</earliest>
+          <latest>now</latest>
+        </search>
+        <option name="charting.chart">bar</option>
+        <option name="charting.axisTitleX.visibility">collapsed</option>
+        <option name="charting.axisTitleY.visibility">collapsed</option>
+        <option name="charting.chart.showDataLabels">all</option>
+        <option name="charting.legend.placement">none</option>
+        <option name="charting.drilldown">none</option>
+        <option name="refresh.display">progressbar</option>
+      </chart>
+    </panel>
+  </row>
+
+  <!-- ============================ LOGINS & ACCESS ============================ -->
+  <row>
+    <panel>
+      <title>Logins, remote access &amp; file-share activity involving $ip$ (SSH, RDP, NTLM, Kerberos, FTP, SMB) - $range_label$</title>
+      <html>
+        <p style="margin:0; font-size:12px; color:#9ea3a8;">Usernames tried, whether they worked, shares mapped and files touched. Only shows log types your Zeek sensor produces and Splunk ingests.</p>
+      </html>
+      <table>
+        <search>
+          <query>index=zeek sourcetype IN ("bro:ssh:json", "bro:rdp:json", "bro:ntlm:json", "bro:kerberos:json", "bro:ftp:json", "bro:smb_mapping:json", "bro:smb_files:json") TERM($ip$) (id.orig_h=$ip|s$ OR id.resp_h=$ip|s$)
+| eval log=replace(sourcetype, "^bro:(.*):json$$", "\1")
+| eval adv_orig=if('id.orig_h'=$ip|s$, 1, 0), peer=if(adv_orig=1, 'id.resp_h', 'id.orig_h'), started_by=if(adv_orig=1, "adversary", "peer")
+| fillnull value="-" username domainname hostname client service cookie result auth_attempts auth_success user command arg path action name success
+| eval detail=case(
+    log="ssh", "client=".client." attempts=".auth_attempts,
+    log="rdp", "cookie/user=".cookie,
+    log="ntlm", domainname."\\".username." from ".hostname,
+    log="kerberos", client." -&gt; ".service,
+    log="ftp", "user=".user." ".command." ".arg,
+    log="smb_mapping", "mapped ".path,
+    log="smb_files", action." ".path."\\".name),
+       outcome=case(log="ssh", "success=".auth_success, log="rdp", result, in(log, "ntlm", "kerberos"), "success=".success, true(), "-")
+| eval nets=mvappend("192.0.2.0/32=unused", split($nets|s$, ","))
+| $peerlabel$
+| stats count min(_time) AS first_seen max(_time) AS last_seen BY log started_by peer detail outcome
+| sort - last_seen
+| eval first_seen=strftime(first_seen, "%Y-%m-%d %H:%M:%S"), last_seen=strftime(last_seen, "%Y-%m-%d %H:%M:%S")
+| table last_seen first_seen log started_by peer detail outcome count</query>
+          <earliest>$range$</earliest>
+          <latest>now</latest>
+        </search>
+        <option name="count">15</option>
+        <option name="wrap">true</option>
+        <option name="drilldown">cell</option>
+        <option name="refresh.display">progressbar</option>
+        <drilldown>
+          <condition field="peer"><eval token="form.ip">replace($click.value2|s$, " .*", "")</eval></condition>
+        </drilldown>
+      </table>
+    </panel>
+  </row>
+
+  <!-- ============================== WEB & FILES ============================== -->
+  <row>
+    <panel>
+      <title>HTTP requests to/from $ip$ - $range_label$</title>
+      <html>
+        <p style="margin:0; font-size:12px; color:#9ea3a8;">KB_up = sent in the request body (uploads, C2 check-ins), KB_down = response body (downloads). mime = file type Zeek detected in the response.</p>
+      </html>
+      <table>
+        <search>
+          <query>index=zeek sourcetype="bro:http:json" TERM($ip$) (id.orig_h=$ip|s$ OR id.resp_h=$ip|s$)
+| eval adv_orig=if('id.orig_h'=$ip|s$, 1, 0), peer=if(adv_orig=1, 'id.resp_h', 'id.orig_h'), started_by=if(adv_orig=1, "adversary", "peer")
+| spath output=http_host path=host
+| eval mime=mvjoin(coalesce('resp_mime_types{}', resp_mime_types), ", ")
+| eval nets=mvappend("192.0.2.0/32=unused", split($nets|s$, ","))
+| $peerlabel$
+| fillnull value="-" method http_host uri status_code mime user_agent
+| stats count sum(request_body_len) AS up sum(response_body_len) AS down max(_time) AS last_seen BY started_by peer method http_host uri status_code mime user_agent
+| sort - last_seen
+| eval KB_up=round(up/1024, 1), KB_down=round(down/1024, 1), last_seen=strftime(last_seen, "%Y-%m-%d %H:%M:%S")
+| table last_seen started_by peer method http_host uri status_code mime user_agent count KB_up KB_down</query>
+          <earliest>$range$</earliest>
+          <latest>now</latest>
+        </search>
+        <option name="count">10</option>
+        <option name="wrap">true</option>
+        <option name="drilldown">cell</option>
+        <option name="refresh.display">progressbar</option>
+        <drilldown>
+          <condition field="peer"><eval token="form.ip">replace($click.value2|s$, " .*", "")</eval></condition>
+        </drilldown>
+      </table>
+    </panel>
+    <panel>
+      <title>Files transferred to/from $ip$ (any protocol) - $range_label$</title>
+      <html>
+        <p style="margin:0; font-size:12px; color:#9ea3a8;">From Zeek files.log: HTTP, SMB, FTP and other transfers. Hashes appear only if hashing is enabled in Zeek. Search the hashes on VirusTotal.</p>
+      </html>
+      <table>
+        <search>
+          <query>index=zeek sourcetype="bro:files:json" TERM($ip$)
+| eval hosts=coalesce(mvjoin('tx_hosts{}', ", ")." -&gt; ".mvjoin('rx_hosts{}', ", "), 'id.resp_h'." &lt;-&gt; ".'id.orig_h', "-")
+| eval KB=round(coalesce(seen_bytes, total_bytes, 0)/1024, 1), time=strftime(_time, "%Y-%m-%d %H:%M:%S")
+| fillnull value="-" source filename mime_type md5 sha1
+| sort - _time
+| table time source hosts filename mime_type KB md5 sha1</query>
+          <earliest>$range$</earliest>
+          <latest>now</latest>
+        </search>
+        <option name="count">10</option>
+        <option name="wrap">true</option>
+        <option name="drilldown">none</option>
+        <option name="refresh.display">progressbar</option>
+      </table>
+    </panel>
+  </row>
+
+  <!-- ============================== DNS & TLS ============================== -->
+  <row>
+    <panel>
+      <title>Domain names that resolved to $ip$, and who looked them up - $range_label$</title>
+      <html>
+        <p style="margin:0; font-size:12px; color:#9ea3a8;">The adversary's domains. Any host that looked one of these up has probably been in contact with it (or will be).</p>
+      </html>
+      <table>
+        <search>
+          <query>index=zeek sourcetype="bro:dns:json" TERM($ip$) NOT id.orig_h=$ip|s$ NOT id.resp_h=$ip|s$
+| eval peer='id.orig_h'
+| eval nets=mvappend("192.0.2.0/32=unused", split($nets|s$, ","))
+| $peerlabel$
+| stats count min(_time) AS first_seen max(_time) AS last_seen values(peer) AS looked_up_by BY query
+| sort - last_seen
+| eval first_seen=strftime(first_seen, "%Y-%m-%d %H:%M:%S"), last_seen=strftime(last_seen, "%Y-%m-%d %H:%M:%S")
+| table query looked_up_by count first_seen last_seen</query>
+          <earliest>$range$</earliest>
+          <latest>now</latest>
+        </search>
+        <option name="count">10</option>
+        <option name="wrap">true</option>
+        <option name="drilldown">cell</option>
+        <option name="refresh.display">progressbar</option>
+        <drilldown>
+          <condition field="looked_up_by"><eval token="form.ip">replace($click.value2|s$, " .*", "")</eval></condition>
+        </drilldown>
+      </table>
+    </panel>
+    <panel>
+      <title>DNS lookups made BY $ip$ - $range_label$</title>
+      <html>
+        <p style="margin:0; font-size:12px; color:#9ea3a8;">Only relevant if the adversary is inside the network or uses one of our DNS servers. Shows what it was trying to find.</p>
+      </html>
+      <table>
+        <search>
+          <query>index=zeek sourcetype="bro:dns:json" TERM($ip$) id.orig_h=$ip|s$
+| eval answers=mvjoin(coalesce('answers{}', answers), ", ")
+| fillnull value="-" qtype_name rcode_name answers
+| stats count max(_time) AS last_seen values(answers) AS answers values(rcode_name) AS rcode BY query qtype_name
+| sort - last_seen
+| eval last_seen=strftime(last_seen, "%Y-%m-%d %H:%M:%S")
+| table last_seen query qtype_name rcode answers count</query>
+          <earliest>$range$</earliest>
+          <latest>now</latest>
+        </search>
+        <option name="count">10</option>
+        <option name="wrap">true</option>
+        <option name="drilldown">none</option>
+        <option name="refresh.display">progressbar</option>
+      </table>
+    </panel>
+    <panel>
+      <title>TLS/HTTPS sessions with $ip$ - $range_label$</title>
+      <html>
+        <p style="margin:0; font-size:12px; color:#9ea3a8;">server_name = hostname requested (SNI). Self-signed or odd certificate subjects/issuers are a common C2 giveaway.</p>
+      </html>
+      <table>
+        <search>
+          <query>index=zeek sourcetype="bro:ssl:json" TERM($ip$) (id.orig_h=$ip|s$ OR id.resp_h=$ip|s$)
+| eval adv_orig=if('id.orig_h'=$ip|s$, 1, 0), peer=if(adv_orig=1, 'id.resp_h', 'id.orig_h'), started_by=if(adv_orig=1, "adversary", "peer")
+| eval nets=mvappend("192.0.2.0/32=unused", split($nets|s$, ","))
+| $peerlabel$
+| fillnull value="-" server_name version subject issuer validation_status ja3
+| stats count max(_time) AS last_seen BY started_by peer server_name version subject issuer validation_status ja3
+| sort - last_seen
+| eval last_seen=strftime(last_seen, "%Y-%m-%d %H:%M:%S")
+| table last_seen started_by peer server_name version subject issuer validation_status ja3 count</query>
+          <earliest>$range$</earliest>
+          <latest>now</latest>
+        </search>
+        <option name="count">10</option>
+        <option name="wrap">true</option>
+        <option name="drilldown">cell</option>
+        <option name="refresh.display">progressbar</option>
+        <drilldown>
+          <condition field="peer"><eval token="form.ip">replace($click.value2|s$, " .*", "")</eval></condition>
+        </drilldown>
+      </table>
+    </panel>
+  </row>
+
+  <!-- ============================== RAW TRAIL ============================== -->
+  <row>
+    <panel>
+      <title>Full trail: every Zeek log entry mentioning $ip$, newest first (max 1000) - $range_label$</title>
+      <html>
+        <p style="margin:0; font-size:12px; color:#9ea3a8;">Catch-all view across every log type. detail = the most useful field for that log (DNS query, URL, TLS name, file name, weird name, or service + connection state). Click a uid to open every log line for that connection in a new tab.</p>
+      </html>
+      <table>
+        <search>
+          <query>index=zeek TERM($ip$)
+| head 1000
+| eval log=replace(sourcetype, "^bro:(.*):json$$", "\1")
+| spath output=http_host path=host
+| eval detail=coalesce(query, if(isnotnull(uri), coalesce(http_host, "")." ".uri, null()), server_name, filename, name, if(log="conn", coalesce(service, proto)." ".conn_state, null()), "-")
+| eval time=strftime(_time, "%Y-%m-%d %H:%M:%S")
+| table time log uid id.orig_h id.orig_p id.resp_h id.resp_p detail</query>
+          <earliest>$range$</earliest>
+          <latest>now</latest>
+        </search>
+        <option name="count">20</option>
+        <option name="wrap">true</option>
+        <option name="drilldown">cell</option>
+        <option name="refresh.display">progressbar</option>
+        <drilldown>
+          <condition field="uid">
+            <link target="_blank">search?q=index%3Dzeek%20$row.uid|u$&amp;earliest=$range$&amp;latest=now</link>
+          </condition>
+        </drilldown>
+      </table>
+    </panel>
+  </row>
+</form>

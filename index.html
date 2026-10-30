@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MatthySoft DFIR Resources</title>
+<meta name="description" content="Damn Fast DFIR printable cheat sheets, Splunk dashboards and the Network Incident Response Playbook.">
+<style>
+  :root {
+    --bg: #0F1419;
+    --panel: #161D25;
+    --line: #26303B;
+    --text: #E6EAF0;
+    --muted: #9AA5B1;
+    --blue: #6181FF;
+    --teal: #2BD4A4;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  main { max-width: 960px; margin: 0 auto; padding: 32px 16px 48px; }
+  header { text-align: center; margin-bottom: 32px; }
+  header img { width: 100%; max-width: 560px; height: auto; border-radius: 8px; }
+  h1 { font-size: 1.6rem; margin: 16px 0 4px; }
+  header p { color: var(--muted); margin: 0; }
+  h2 {
+    font-size: 1.1rem;
+    margin: 32px 0 12px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--line);
+    color: var(--teal);
+  }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 14px 16px;
+    display: flex;
+    flex-direction: column;
+  }
+  .card h3 { font-size: 1rem; margin: 0 0 4px; }
+  .card p { color: var(--muted); font-size: 0.9rem; margin: 0 0 12px; flex: 1; }
+  .meta { color: var(--muted); font-size: 0.8rem; margin-bottom: 10px; }
+  .actions { display: flex; gap: 8px; }
+  .actions a {
+    flex: 1;
+    text-align: center;
+    text-decoration: none;
+    font-size: 0.9rem;
+    padding: 6px 10px;
+    border-radius: 6px;
+    border: 1px solid var(--blue);
+    color: var(--blue);
+  }
+  .actions a.primary { background: var(--blue); color: #fff; }
+  .actions a:hover { filter: brightness(1.15); }
+  footer { margin-top: 48px; text-align: center; color: var(--muted); font-size: 0.85rem; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <img src="assets/dfd_logo.png" alt="Damn Fast DFIR logo">
+    <h1>Damn Fast DFIR Resources</h1>
+    <p>Printable cheat sheets, Splunk dashboards and incident response playbook.</p>
+  </header>
+
+  <h2>Playbook</h2>
+  <div class="grid">
+    <div class="card">
+      <h3>Network Incident Response Playbook</h3>
+      <p>Generic step-by-step playbook for handling a network incident.</p>
+      <div class="meta">PDF &middot; 2.3 MB</div>
+      <div class="actions">
+        <a class="primary" href="files/Network_Incident_Response_Playbook_generic.pdf" target="_blank" rel="noopener">Open</a>
+        <a href="files/Network_Incident_Response_Playbook_generic.pdf" download>Download</a>
+      </div>
+    </div>
+  </div>
+
+  <h2>A4 cheat sheets</h2>
+  <div class="grid">
+    <div class="card">
+      <h3>Cyber Bible</h3>
+      <p>The full dfd DFIR reference in printable form.</p>
+      <div class="meta">PDF &middot; 15 pages &middot; 1.9 MB</div>
+      <div class="actions">
+        <a class="primary" href="files/dfd_cyber_bible_a4.pdf" target="_blank" rel="noopener">Open</a>
+        <a href="files/dfd_cyber_bible_a4.pdf" download>Download</a>
+      </div>
+    </div>
+    <div class="card">
+      <h3>Router &amp; Firewall</h3>
+      <p>Blocking IPs and ranges on VyOS, Cisco, Junos, FortiGate, PAN-OS, MikroTik, pfSense, Linux and Windows.</p>
+      <div class="meta">PDF &middot; 7 pages &middot; 0.9 MB</div>
+      <div class="actions">
+        <a class="primary" href="files/dfd_router_firewall_cheatsheet_a4.pdf" target="_blank" rel="noopener">Open</a>
+        <a href="files/dfd_router_firewall_cheatsheet_a4.pdf" download>Download</a>
+      </div>
+    </div>
+    <div class="card">
+      <h3>Splunk SPL</h3>
+      <p>SPL searches and hunts over Zeek logs.</p>
+      <div class="meta">PDF &middot; 4 pages &middot; 0.6 MB</div>
+      <div class="actions">
+        <a class="primary" href="files/dfd_splunk_cheatsheet_a4.pdf" target="_blank" rel="noopener">Open</a>
+        <a href="files/dfd_splunk_cheatsheet_a4.pdf" download>Download</a>
+      </div>
+    </div>
+    <div class="card">
+      <h3>Arkime</h3>
+      <p>Arkime search syntax and packet capture triage.</p>
+      <div class="meta">PDF &middot; 3 pages &middot; 0.6 MB</div>
+      <div class="actions">
+        <a class="primary" href="files/dfd_arkime_cheatsheet_a4.pdf" target="_blank" rel="noopener">Open</a>
+        <a href="files/dfd_arkime_cheatsheet_a4.pdf" download>Download</a>
+      </div>
+    </div>
+    <div class="card">
+      <h3>Windows</h3>
+      <p>Live response commands for Windows hosts.</p>
+      <div class="meta">PDF &middot; 3 pages &middot; 0.3 MB</div>
+      <div class="actions">
+        <a class="primary" href="files/dfd_windows_cheatsheet_a4.pdf" target="_blank" rel="noopener">Open</a>
+        <a href="files/dfd_windows_cheatsheet_a4.pdf" download>Download</a>
+      </div>
+    </div>
+    <div class="card">
+      <h3>Linux</h3>
+      <p>Live response commands for Linux hosts.</p>
+      <div class="meta">PDF &middot; 2 pages &middot; 0.3 MB</div>
+      <div class="actions">
+        <a class="primary" href="files/dfd_linux_cheatsheet_a4.pdf" target="_blank" rel="noopener">Open</a>
+        <a href="files/dfd_linux_cheatsheet_a4.pdf" download>Download</a>
+      </div>
+    </div>
+  </div>
+
+  <h2>Splunk dashboards</h2>
+  <div class="grid">
+    <div class="card">
+      <h3>Zeek Network Monitoring</h3>
+      <p>Splunk Classic (Simple XML) dashboard over Zeek JSON logs. No lookups or macros needed. Paste into a new dashboard's source view.</p>
+      <div class="meta">Simple XML &middot; 37 KB</div>
+      <div class="actions">
+        <a class="primary" href="files/net_dashboard.txt" target="_blank" rel="noopener">View</a>
+        <a href="files/net_dashboard.txt" download>Download</a>
+      </div>
+    </div>
+    <div class="card">
+      <h3>Adversary IP Tracker</h3>
+      <p>Enter one IP and every panel shows its activity across all Zeek logs. Paste into a new dashboard's source view.</p>
+      <div class="meta">Simple XML &middot; 24 KB</div>
+      <div class="actions">
+        <a class="primary" href="files/adversary_dashboard.txt" target="_blank" rel="noopener">View</a>
+        <a href="files/adversary_dashboard.txt" download>Download</a>
+      </div>
+    </div>
+  </div>
+
+  <footer>Another quality MatthySoft product</footer>
+</main>
+</body>
+</html>

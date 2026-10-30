@@ -1,0 +1,781 @@
+<form version="1.1" theme="dark" refresh="300">
+  <label>DM_Net - Zeek Network Monitoring</label>
+  <description>Internal ranges and labels are set in the Internal networks box; traffic to/from anything in Ignore subnets is hidden from every panel (edit the defaults in the XML to make them permanent). Click any src / dest IP to filter the whole dashboard to it; set Filter back to * to clear. Auto-refreshes every 5 minutes.</description>
+
+  <init>
+    <!-- nets / ign always get a dummy 192.0.2.0/32 entry (reserved TEST-NET address, never real traffic)
+         so they are multivalue even when the box holds a single CIDR; mvmap needs that.
+         Shared enrichment, used as  | eval nets=mvappend("192.0.2.0/32=unused", split($nets|s$, ",")), ign=mvappend("192.0.2.0/32", split($ignore|s$, ",")) | $enrich$
+         Drops anything to/from the Ignore subnets.
+         Adds: src_ip dest_ip dport, src_net dest_net (label, empty = external),
+               src / dest ("IP (label)"), direction (outbound|inbound|internal|external), dir.
+         Multicast / broadcast / link-local destinations count as internal. -->
+    <set token="enrich">rename id.orig_h AS src_ip, id.resp_h AS dest_ip, id.resp_p AS dport
+| eval ignored=mvindex(mvmap(ign, if(cidrmatch(if(match(ign, "/"), trim(ign), "192.0.2.0/32"), src_ip) OR cidrmatch(if(match(ign, "/"), trim(ign), "192.0.2.0/32"), dest_ip), 1, null())), 0)
+| where isnull(ignored)
+| eval src_net=mvindex(mvmap(nets, if(cidrmatch(trim(mvindex(split(nets, "="), 0)), src_ip), coalesce(trim(mvindex(split(nets, "="), 1)), "internal"), null())), 0)
+| eval dest_net=mvindex(mvmap(nets, if(cidrmatch(trim(mvindex(split(nets, "="), 0)), dest_ip), coalesce(trim(mvindex(split(nets, "="), 1)), "internal"), null())), 0)
+| eval direction=case(
+    isnotnull(src_net) AND isnotnull(dest_net), "internal",
+    cidrmatch("224.0.0.0/4", dest_ip) OR cidrmatch("169.254.0.0/16", dest_ip) OR dest_ip="255.255.255.255" OR match(dest_ip, "(?i)^(ff0|fe80:)"), "internal",
+    isnotnull(src_net), "outbound",
+    isnotnull(dest_net), "inbound",
+    true(), "external")
+| eval src=if(isnotnull(src_net), src_ip." (".src_net.")", src_ip),
+       dest=if(isnotnull(dest_net), dest_ip." (".dest_net.")", dest_ip),
+       dir=case(direction="outbound", "OUT -&gt;", direction="inbound", "&lt;- IN", direction="internal", "INT", true(), "EXT")
+| fields - nets ign ignored</set>
+    <set token="prev10">...</set>
+    <set token="n_ua">...</set>
+    <set token="n_mime">...</set>
+    <set token="n_conn">...</set>
+    <set token="n_brute">...</set>
+    <set token="range_label">Last hour</set>
+    <set token="newlabel">in the last 24 hours</set>
+  </init>
+
+  <!-- ===================== BASE SEARCHES (alert tables up top) ===================== -->
+  <search id="new_ua">
+    <query>index=zeek sourcetype="bro:http:json" $search$ user_agent=*
+| stats min(_time) AS first_seen max(_time) AS last_seen count BY user_agent id.orig_h id.resp_h
+| eventstats min(first_seen) AS ua_first_seen BY user_agent
+| where ua_first_seen &gt;= relative_time(now(), "$newwin$")
+| eval nets=mvappend("192.0.2.0/32=unused", split($nets|s$, ",")), ign=mvappend("192.0.2.0/32", split($ignore|s$, ","))
+| $enrich$
+| search $direction$
+| stats min(first_seen) AS first_seen max(last_seen) AS last_seen sum(count) AS count values(dir) AS dir values(src) AS src values(dest) AS dest BY user_agent
+| sort - first_seen
+| eval dest=mvindex(dest, 0, 4), first_seen=strftime(first_seen, "%Y-%m-%d %H:%M:%S"), last_seen=strftime(last_seen, "%Y-%m-%d %H:%M:%S")
+| table first_seen user_agent src dest count</query>
+    <earliest>-7d@d</earliest>
+    <latest>now</latest>
+    <done><set token="n_ua">$job.resultCount$</set></done>
+  </search>
+
+  <search id="sus_mime">
+    <query>index=zeek sourcetype="bro:http:json" $search$ NOT "velociraptor_client_repacked.exe"
+| eval mime=mvjoin(coalesce('resp_mime_types{}', resp_mime_types), ", ")
+| where match(mime, "(?i)(x-dosexec|x-msdownload|x-executable|portable-executable|x-msdos-program|x-msi|x-ms-installer|x-sh\b|shellscript|java-archive|x-elf|x-mach-o|x-ms-shortcut|/hta\b|zip|x-rar|7z-compressed|ms-cab|iso9660)")
+| eval filename=mvjoin(coalesce('resp_filenames{}', resp_filenames), ", ")
+| eval nets=mvappend("192.0.2.0/32=unused", split($nets|s$, ",")), ign=mvappend("192.0.2.0/32", split($ignore|s$, ","))
+| $enrich$
+| search $direction$
+| fillnull value="-" uri filename
+| stats count latest(_time) AS last_seen BY mime dir src dest uri filename
+| sort - last_seen
+| eval last_seen=strftime(last_seen, "%Y-%m-%d %H:%M:%S")
+| table last_seen mime filename src dest uri count</query>
+    <earliest>$range$</earliest>
+    <latest>now</latest>
+    <done><set token="n_mime">$job.resultCount$</set></done>
+  </search>
+
+  <search id="sus_conn">
+    <query>index=zeek sourcetype="bro:conn:json" $search$
+| eval nets=mvappend("192.0.2.0/32=unused", split($nets|s$, ",")), ign=mvappend("192.0.2.0/32", split($ignore|s$, ","))
+| $enrich$
+| search $direction$
+| fillnull value="-" service
+| eval reason=case(
+    in(dport, 4444, 1337, 31337, 5555), "Known backdoor / C2 port",
+    in(dport, 9001, 9030, 9050, 9150), "Tor port",
+    match(service, "irc") OR in(dport, 6660, 6666, 6667, 6697), "IRC",
+    match(service, "socks") OR dport=1080, "SOCKS proxy",
+    match(service, "(telnet|rlogin|ftp)") OR in(dport, 21, 23), "Cleartext login protocol",
+    match(service, "(smb|dce_rpc|ntlm|krb|ldap|rdp|rfb)") OR in(dport, 135, 139, 445, 3389, 5900, 5985, 5986), "Windows / remote-admin protocol",
+    service="ssh" AND dport!=22, "SSH on non-standard port",
+    service="http" AND NOT in(dport, 80, 8080, 8000, 8008, 8888), "HTTP on non-standard port",
+    service="ssl" AND NOT in(dport, 443, 8443, 993, 995, 465, 636, 853, 5986), "TLS on non-standard port",
+    service="dns" AND dport!=53, "DNS on non-standard port",
+    dport=53 AND service!="dns" AND conn_state="SF", "Non-DNS traffic on port 53",
+    proto="tcp" AND in(dport, 80, 443) AND service="-" AND conn_state="SF" AND resp_bytes&gt;0, "Unidentified traffic on web port")
+| where isnotnull(reason)
+| eval protocol=if(service="-", proto." (unidentified)", service), port=proto."/".dport
+| stats count AS conns latest(_time) AS last_seen BY reason protocol port src dest
+| sort - last_seen
+| eval last_seen=strftime(last_seen, "%Y-%m-%d %H:%M:%S")
+| table last_seen reason protocol port src dest conns</query>
+    <earliest>$range$</earliest>
+    <latest>now</latest>
+    <done><set token="n_conn">$job.resultCount$</set></done>
+  </search>
+
+  <search id="brute">
+    <query>index=zeek sourcetype="bro:conn:json" $search$ id.resp_p IN (21, 22, 23, 88, 139, 389, 445, 636, 1433, 3306, 3389, 5432, 5900, 5985, 5986)
+| eval nets=mvappend("192.0.2.0/32=unused", split($nets|s$, ",")), ign=mvappend("192.0.2.0/32", split($ignore|s$, ","))
+| $enrich$
+| search $direction$
+| eval port_name=case(dport=21,"FTP", dport=22,"SSH", dport=23,"Telnet", dport=88,"Kerberos", dport=139,"NetBIOS", dport=389,"LDAP", dport=445,"SMB", dport=636,"LDAPS", dport=1433,"MSSQL", dport=3306,"MySQL", dport=3389,"RDP", dport=5432,"PostgreSQL", dport=5900,"VNC", dport=5985,"WinRM", dport=5986,"WinRM-TLS")
+| bin _time span=10m
+| stats count AS attempts values(conn_state) AS states BY _time dir src dest dport port_name
+| where attempts &gt;= 20
+| stats max(attempts) AS peak_per_10m sum(attempts) AS total max(_time) AS last_window values(states) AS states BY dir src dest dport port_name
+| sort - peak_per_10m
+| eval last_window=strftime(last_window, "%Y-%m-%d %H:%M"), port="tcp/".dport
+| rename port_name AS protocol
+| table last_window protocol port src dest peak_per_10m total</query>
+    <earliest>$range$</earliest>
+    <latest>now</latest>
+    <done><set token="n_brute">$job.resultCount$</set></done>
+  </search>
+
+  <fieldset submitButton="false" autoRun="true">
+    <input type="dropdown" token="range" searchWhenChanged="true">
+      <label>Time range</label>
+      <choice value="-10m">Last 10 minutes</choice>
+      <choice value="-1h">Last hour</choice>
+      <choice value="-4h">Last 4 hours</choice>
+      <choice value="-24h">Last 24 hours</choice>
+      <choice value="-7d">Last 7 days</choice>
+      <default>-1h</default>
+      <change>
+        <set token="range_label">$label$</set>
+      </change>
+    </input>
+    <input type="text" token="nets" searchWhenChanged="true">
+      <label>Internal networks (CIDR=label, comma-separated)</label>
+      <default>172.16.1.0/24=NET-1, 172.16.2.0/24=NET-2, 172.16.3.0/24=NET-3, 172.16.4.0/24=NET-4, 172.16.5.0/24=NET-5, 172.16.9.0/24=NET-9</default>
+    </input>
+    <input type="text" token="ignore" searchWhenChanged="true">
+      <label>Ignore subnets (CIDR, comma-separated; none = off)</label>
+      <default>none</default>
+    </input>
+    <input type="text" token="search" searchWhenChanged="true">
+      <label>Filter (IP, domain, any term)</label>
+      <default>*</default>
+      <initialValue>*</initialValue>
+    </input>
+    <input type="multiselect" token="direction" searchWhenChanged="true">
+      <label>Traffic direction</label>
+      <choice value="outbound">Outbound (internal -&gt; external)</choice>
+      <choice value="inbound">Inbound (external -&gt; internal)</choice>
+      <choice value="internal">Internal &lt;-&gt; internal</choice>
+      <choice value="external">External &lt;-&gt; external</choice>
+      <default>outbound,inbound</default>
+      <prefix>direction IN (</prefix>
+      <suffix>)</suffix>
+      <delimiter>, </delimiter>
+    </input>
+    <input type="dropdown" token="newwin" searchWhenChanged="true">
+      <label>"New" = first seen</label>
+      <choice value="-1h">in the last hour</choice>
+      <choice value="-4h">in the last 4 hours</choice>
+      <choice value="-24h">in the last 24 hours</choice>
+      <default>-24h</default>
+      <change>
+        <set token="newlabel">$label$</set>
+      </change>
+    </input>
+  </fieldset>
+
+  <!-- ============================== ALERTS ============================== -->
+  <row>
+    <!-- Hidden panel: CSS to make the connections tile narrow and the two alert tables wide -->
+    <panel depends="$never_set$">
+      <html>
+        <style>
+          #conn10 { width: 16% !important; }
+          #brute_p, #susconn_p { width: 42% !important; }
+        </style>
+      </html>
+    </panel>
+    <panel id="conn10">
+      <title>Connections in/out of the network - last 10 min</title>
+      <single>
+        <search>
+          <query>index=zeek sourcetype="bro:conn:json" $search$
+| eval nets=mvappend("192.0.2.0/32=unused", split($nets|s$, ",")), ign=mvappend("192.0.2.0/32", split($ignore|s$, ","))
+| $enrich$
+| search $direction$
+| eval period=if(_time &gt;= relative_time(now(), "-10m"), "now", "prev")
+| stats count(eval(period="now")) AS last_10m count(eval(period="prev")) AS prev_10m
+| table last_10m prev_10m</query>
+          <earliest>-20m</earliest>
+          <latest>now</latest>
+          <done>
+            <set token="prev10">$result.prev_10m$</set>
+          </done>
+        </search>
+        <option name="underLabel">previous 10 min: $prev10$</option>
+        <option name="drilldown">none</option>
+        <option name="refresh.display">progressbar</option>
+      </single>
+    </panel>
+    <panel id="brute_p">
+      <title>Brute-force suspects: $n_brute$ found (&gt;= 20 connections to one login port within 10 min) - $range_label$</title>
+      <html>
+        <p style="margin:0; font-size:12px; color:#9ea3a8;">Login ports: SSH, RDP, SMB, FTP, Telnet, WinRM, VNC, LDAP, Kerberos, SQL. peak_per_10m = most attempts in any 10-minute window. Empty = nothing found.</p>
+      </html>
+      <table>
+        <search base="brute"></search>
+        <option name="count">5</option>
+        <option name="wrap">true</option>
+        <option name="drilldown">cell</option>
+        <option name="refresh.display">progressbar</option>
+        <format type="color" field="peak_per_10m">
+          <colorPalette type="minMidMax" minColor="#31373E" maxColor="#DC4E41"></colorPalette>
+          <scale type="minMidMax"></scale>
+        </format>
+        <drilldown>
+          <condition field="src"><eval token="form.search">replace($click.value2|s$, " .*", "")</eval></condition>
+          <condition field="dest"><eval token="form.search">replace($click.value2|s$, " .*", "")</eval></condition>
+        </drilldown>
+      </table>
+    </panel>
+    <panel id="susconn_p">
+      <title>Suspicious protocol / port flows: $n_conn$ found, crossing the network boundary - $range_label$</title>
+      <html>
+        <p style="margin:0; font-size:12px; color:#9ea3a8;">Backdoor/C2 and Tor ports, IRC, SOCKS, cleartext logins, Windows/remote-admin protocols, and protocols on ports they don't belong on. protocol = what Zeek actually detected.</p>
+      </html>
+      <table>
+        <search base="sus_conn"></search>
+        <option name="count">5</option>
+        <option name="wrap">true</option>
+        <option name="drilldown">cell</option>
+        <option name="refresh.display">progressbar</option>
+        <format type="color" field="conns">
+          <colorPalette type="minMidMax" minColor="#31373E" maxColor="#DC4E41"></colorPalette>
+          <scale type="minMidMax"></scale>
+        </format>
+        <drilldown>
+          <condition field="src"><eval token="form.search">replace($click.value2|s$, " .*", "")</eval></condition>
+          <condition field="dest"><eval token="form.search">replace($click.value2|s$, " .*", "")</eval></condition>
+        </drilldown>
+      </table>
+    </panel>
+  </row>
+
+  <row>
+    <panel id="newua_p">
+      <title>New HTTP user agents: $n_ua$ first seen $newlabel$ (not seen in the 7 days before)</title>
+      <html>
+        <p style="margin:0; font-size:12px; color:#9ea3a8;">Software making web requests that hasn't been seen before: new malware, attacker tools or scripts (curl, python, PowerShell). Empty = nothing new.</p>
+      </html>
+      <table>
+        <search base="new_ua"></search>
+        <option name="count">5</option>
+        <option name="wrap">true</option>
+        <option name="drilldown">cell</option>
+        <option name="refresh.display">progressbar</option>
+        <format type="color" field="count">
+          <colorPalette type="minMidMax" minColor="#31373E" maxColor="#DC4E41"></colorPalette>
+          <scale type="minMidMax"></scale>
+        </format>
+        <drilldown>
+          <condition field="src"><eval token="form.search">replace($click.value2|s$, " .*", "")</eval></condition>
+          <condition field="dest"><eval token="form.search">replace($click.value2|s$, " .*", "")</eval></condition>
+        </drilldown>
+      </table>
+    </panel>
+    <panel id="susmime_p">
+      <title>Suspicious file downloads: $n_mime$ executables, scripts &amp; archives over HTTP (by detected file type) - $range_label$</title>
+      <html>
+        <p style="margin:0; font-size:12px; color:#9ea3a8;">Uses Zeek's content-based file type detection, so renamed files are still caught. velociraptor_client_repacked.exe is excluded. Empty = nothing found.</p>
+      </html>
+      <table>
+        <search base="sus_mime"></search>
+        <option name="count">5</option>
+        <option name="wrap">true</option>
+        <option name="drilldown">cell</option>
+        <option name="refresh.display">progressbar</option>
+        <format type="color" field="count">
+          <colorPalette type="minMidMax" minColor="#31373E" maxColor="#DC4E41"></colorPalette>
+          <scale type="minMidMax"></scale>
+        </format>
+        <drilldown>
+          <condition field="src"><eval token="form.search">replace($click.value2|s$, " .*", "")</eval></condition>
+          <condition field="dest"><eval token="form.search">replace($click.value2|s$, " .*", "")</eval></condition>
+        </drilldown>
+      </table>
+    </panel>
+  </row>
+
+  <row>
+    <panel>
+      <title>Files with risky extensions (.exe .ps1 .hta .zip ...) requested over HTTP - $range_label$</title>
+      <html>
+        <p style="margin:0; font-size:12px; color:#9ea3a8;">Matches the file extension in the URL, so it also catches failed or blocked downloads (see status).</p>
+      </html>
+      <table>
+        <search>
+          <query>index=zeek sourcetype="bro:http:json" $search$ uri=*
+| rex field=uri "^(?&lt;path&gt;[^?#]*)"
+| rex field=path "(?i)\.(?&lt;ext&gt;exe|dll|scr|msi|ps1|psm1|vbs|vbe|hta|bat|cmd|lnk|jar|iso|img|cab|zip|rar|7z|gz)$$"
+| where isnotnull(ext)
+| spath output=http_host path=host
+| eval nets=mvappend("192.0.2.0/32=unused", split($nets|s$, ",")), ign=mvappend("192.0.2.0/32", split($ignore|s$, ","))
+| $enrich$
+| search $direction$
+| fillnull value="-" http_host status_code
+| stats count latest(_time) AS last_seen values(status_code) AS status BY dir src dest http_host uri
+| sort - last_seen
+| eval last_seen=strftime(last_seen, "%Y-%m-%d %H:%M:%S")
+| table last_seen dir src dest http_host uri status count</query>
+          <earliest>$range$</earliest>
+          <latest>now</latest>
+        </search>
+        <option name="count">10</option>
+        <option name="wrap">true</option>
+        <option name="drilldown">cell</option>
+        <option name="refresh.display">progressbar</option>
+        <drilldown>
+          <condition field="src"><eval token="form.search">replace($click.value2|s$, " .*", "")</eval></condition>
+          <condition field="dest"><eval token="form.search">replace($click.value2|s$, " .*", "")</eval></condition>
+        </drilldown>
+      </table>
+    </panel>
+    <panel>
+      <title>Possible C2 beaconing: internal -&gt; external connections at regular intervals - $range_label$</title>
+      <html>
+        <p style="margin:0; font-size:12px; color:#9ea3a8;">&gt;= 10 connections, average gap &gt;= 5 s, timing jitter under 20 %. Lower jitter = more machine-like. Needs a range of 1 hour or more.</p>
+      </html>
+      <table>
+        <search>
+          <query>index=zeek sourcetype="bro:conn:json" $search$ NOT id.resp_p IN (53, 123, 137, 138, 1900, 5353)
+| eval nets=mvappend("192.0.2.0/32=unused", split($nets|s$, ",")), ign=mvappend("192.0.2.0/32", split($ignore|s$, ","))
+| $enrich$
+| search direction="outbound"
+| streamstats current=false last(_time) AS prev_time BY src dest dport
+| eval gap=abs(prev_time - _time)
+| stats count AS conns avg(gap) AS avg_gap stdev(gap) AS jitter BY src dest dport
+| where conns &gt;= 10 AND avg_gap &gt;= 5
+| eval jitter_pct=round(jitter / avg_gap * 100, 1), avg_gap_s=round(avg_gap, 1)
+| where jitter_pct &lt; 20
+| sort jitter_pct
+| table src dest dport conns avg_gap_s jitter_pct</query>
+          <earliest>$range$</earliest>
+          <latest>now</latest>
+        </search>
+        <option name="count">10</option>
+        <option name="drilldown">cell</option>
+        <option name="refresh.display">progressbar</option>
+        <format type="color" field="jitter_pct">
+          <colorPalette type="minMidMax" minColor="#DC4E41" maxColor="#31373E"></colorPalette>
+          <scale type="minMidMax"></scale>
+        </format>
+        <drilldown>
+          <condition field="src"><eval token="form.search">replace($click.value2|s$, " .*", "")</eval></condition>
+          <condition field="dest"><eval token="form.search">replace($click.value2|s$, " .*", "")</eval></condition>
+        </drilldown>
+      </table>
+    </panel>
+  </row>
+
+  <row>
+    <panel>
+      <title>Possible scanners: sources with failed connections to > 20 ports or > 20 hosts - $range_label$</title>
+      <html>
+        <p style="margin:0; font-size:12px; color:#9ea3a8;">ports = distinct ports tried (port scan), hosts = distinct hosts tried (sweep), failed = unanswered or rejected connections.</p>
+      </html>
+      <table>
+        <search>
+          <query>index=zeek sourcetype="bro:conn:json" $search$ conn_state IN (S0, REJ, RSTOS0, RSTRH, SH)
+| eval nets=mvappend("192.0.2.0/32=unused", split($nets|s$, ",")), ign=mvappend("192.0.2.0/32", split($ignore|s$, ","))
+| $enrich$
+| search $direction$
+| stats count AS failed dc(dport) AS ports dc(dest_ip) AS hosts values(dir) AS dir BY src
+| where ports &gt; 20 OR hosts &gt; 20
+| sort - ports
+| table dir src failed ports hosts</query>
+          <earliest>$range$</earliest>
+          <latest>now</latest>
+        </search>
+        <option name="count">10</option>
+        <option name="drilldown">cell</option>
+        <option name="refresh.display">progressbar</option>
+        <drilldown>
+          <condition field="src"><eval token="form.search">replace($click.value2|s$, " .*", "")</eval></condition>
+        </drilldown>
+      </table>
+    </panel>
+    <panel>
+      <title>Long-lived connections lasting over 30 minutes - $range_label$</title>
+      <html>
+        <p style="margin:0; font-size:12px; color:#9ea3a8;">Tunnels, remote shells, VPNs and C2 sessions tend to stay open. Zeek logs a connection when it ends.</p>
+      </html>
+      <table>
+        <search>
+          <query>index=zeek sourcetype="bro:conn:json" $search$ duration&gt;1800
+| eval nets=mvappend("192.0.2.0/32=unused", split($nets|s$, ",")), ign=mvappend("192.0.2.0/32", split($ignore|s$, ","))
+| $enrich$
+| search $direction$
+| fillnull value="-" service
+| sort - duration
+| head 20
+| eval started=strftime(_time, "%Y-%m-%d %H:%M:%S"), length=tostring(round(duration), "duration"), MB_out=round(orig_bytes/1048576, 2), MB_in=round(resp_bytes/1048576, 2)
+| table started dir src dest dport service length MB_out MB_in</query>
+          <earliest>$range$</earliest>
+          <latest>now</latest>
+        </search>
+        <option name="count">10</option>
+        <option name="drilldown">cell</option>
+        <option name="refresh.display">progressbar</option>
+        <drilldown>
+          <condition field="src"><eval token="form.search">replace($click.value2|s$, " .*", "")</eval></condition>
+          <condition field="dest"><eval token="form.search">replace($click.value2|s$, " .*", "")</eval></condition>
+        </drilldown>
+      </table>
+    </panel>
+  </row>
+
+  <!-- ========================= BOUNDARY TRAFFIC ========================= -->
+  <row>
+    <panel>
+      <title>Connections over time, split by direction - $range_label$</title>
+      <chart>
+        <search>
+          <query>index=zeek sourcetype="bro:conn:json" $search$
+| eval nets=mvappend("192.0.2.0/32=unused", split($nets|s$, ",")), ign=mvappend("192.0.2.0/32", split($ignore|s$, ","))
+| $enrich$
+| search $direction$
+| timechart count BY direction</query>
+          <earliest>$range$</earliest>
+          <latest>now</latest>
+        </search>
+        <option name="charting.chart">line</option>
+        <option name="charting.axisTitleX.visibility">collapsed</option>
+        <option name="charting.axisTitleY.text">connections</option>
+        <option name="charting.legend.placement">bottom</option>
+        <option name="charting.drilldown">none</option>
+        <option name="refresh.display">progressbar</option>
+      </chart>
+    </panel>
+    <panel>
+      <title>Connections per protocol (service), split by direction - $range_label$</title>
+      <html>
+        <p style="margin:0; font-size:12px; color:#9ea3a8;">Log scale, so small counts are still visible next to DNS/TLS. 'unidentified' = Zeek couldn't recognise the protocol.</p>
+      </html>
+      <chart>
+        <search>
+          <query>index=zeek sourcetype="bro:conn:json" $search$
+| eval nets=mvappend("192.0.2.0/32=unused", split($nets|s$, ",")), ign=mvappend("192.0.2.0/32", split($ignore|s$, ","))
+| $enrich$
+| search $direction$
+| eval service=coalesce(service, proto." (unidentified)")
+| chart count OVER service BY direction
+| addtotals
+| sort - Total
+| head 12
+| fields - Total</query>
+          <earliest>$range$</earliest>
+          <latest>now</latest>
+        </search>
+        <option name="charting.chart">bar</option>
+        <option name="charting.axisY.scale">log</option>
+        <option name="charting.axisTitleX.visibility">collapsed</option>
+        <option name="charting.axisTitleY.visibility">collapsed</option>
+        <option name="charting.legend.placement">bottom</option>
+        <option name="charting.drilldown">none</option>
+        <option name="refresh.display">progressbar</option>
+      </chart>
+    </panel>
+  </row>
+
+  <row>
+    <panel>
+      <title>Internal hosts with the most connections to/from outside - $range_label$</title>
+      <chart>
+        <search>
+          <query>index=zeek sourcetype="bro:conn:json" $search$
+| eval nets=mvappend("192.0.2.0/32=unused", split($nets|s$, ",")), ign=mvappend("192.0.2.0/32", split($ignore|s$, ","))
+| $enrich$
+| search $direction$ direction IN (outbound, inbound)
+| eval internal_host=if(direction="outbound", src, dest)
+| chart count OVER internal_host BY direction
+| addtotals
+| sort - Total
+| head 10
+| fields - Total</query>
+          <earliest>$range$</earliest>
+          <latest>now</latest>
+        </search>
+        <option name="charting.chart">bar</option>
+        <option name="charting.chart.stackMode">stacked</option>
+        <option name="charting.axisTitleX.visibility">collapsed</option>
+        <option name="charting.axisTitleY.visibility">collapsed</option>
+        <option name="charting.legend.placement">bottom</option>
+        <option name="refresh.display">progressbar</option>
+        <drilldown>
+          <eval token="form.search">replace($click.value|s$, " .*", "")</eval>
+        </drilldown>
+      </chart>
+    </panel>
+    <panel>
+      <title>External IPs with the most connections to/from us - $range_label$</title>
+      <chart>
+        <search>
+          <query>index=zeek sourcetype="bro:conn:json" $search$
+| eval nets=mvappend("192.0.2.0/32=unused", split($nets|s$, ",")), ign=mvappend("192.0.2.0/32", split($ignore|s$, ","))
+| $enrich$
+| search $direction$ direction IN (outbound, inbound)
+| eval external_host=if(direction="outbound", dest_ip, src_ip)
+| chart count OVER external_host BY direction
+| addtotals
+| sort - Total
+| head 10
+| fields - Total</query>
+          <earliest>$range$</earliest>
+          <latest>now</latest>
+        </search>
+        <option name="charting.chart">bar</option>
+        <option name="charting.chart.stackMode">stacked</option>
+        <option name="charting.axisTitleX.visibility">collapsed</option>
+        <option name="charting.axisTitleY.visibility">collapsed</option>
+        <option name="charting.legend.placement">bottom</option>
+        <option name="refresh.display">progressbar</option>
+        <drilldown>
+          <set token="form.search">$click.value|s$</set>
+        </drilldown>
+      </chart>
+    </panel>
+    <panel>
+      <title>Data sent from internal -&gt; external over time, top 5 senders (MB) - $range_label$</title>
+      <chart>
+        <search>
+          <query>index=zeek sourcetype="bro:conn:json" $search$
+| eval nets=mvappend("192.0.2.0/32=unused", split($nets|s$, ",")), ign=mvappend("192.0.2.0/32", split($ignore|s$, ","))
+| $enrich$
+| search direction="outbound"
+| eval MB=orig_bytes/1048576
+| timechart sum(MB) AS MB BY src limit=5 useother=true</query>
+          <earliest>$range$</earliest>
+          <latest>now</latest>
+        </search>
+        <option name="charting.chart">area</option>
+        <option name="charting.chart.stackMode">stacked</option>
+        <option name="charting.axisTitleX.visibility">collapsed</option>
+        <option name="charting.axisTitleY.text">MB</option>
+        <option name="charting.legend.placement">bottom</option>
+        <option name="charting.drilldown">none</option>
+        <option name="refresh.display">progressbar</option>
+      </chart>
+    </panel>
+  </row>
+
+  <row>
+    <panel>
+      <title>Largest internal -&gt; external transfers over 500 KB, top 15 (MB) - $range_label$</title>
+      <html>
+        <p style="margin:0; font-size:12px; color:#9ea3a8;">Total bytes each internal host sent to each external IP. Watch for exfiltration.</p>
+      </html>
+      <chart>
+        <search>
+          <query>index=zeek sourcetype="bro:conn:json" $search$
+| eval nets=mvappend("192.0.2.0/32=unused", split($nets|s$, ",")), ign=mvappend("192.0.2.0/32", split($ignore|s$, ","))
+| $enrich$
+| search direction="outbound"
+| stats sum(orig_bytes) AS bytes BY src dest
+| where bytes &gt; 512000
+| eval MB=round(bytes/1048576, 2), flow=src." -&gt; ".dest
+| sort - MB
+| head 15
+| table flow MB</query>
+          <earliest>$range$</earliest>
+          <latest>now</latest>
+        </search>
+        <option name="charting.chart">bar</option>
+        <option name="charting.axisTitleX.visibility">collapsed</option>
+        <option name="charting.axisTitleY.text">MB sent</option>
+        <option name="charting.chart.showDataLabels">all</option>
+        <option name="charting.legend.placement">none</option>
+        <option name="charting.drilldown">none</option>
+        <option name="refresh.display">progressbar</option>
+      </chart>
+    </panel>
+    <panel>
+      <title>HTTP POST requests (uploads / form submissions), largest first - $range_label$</title>
+      <html>
+        <p style="margin:0; font-size:12px; color:#9ea3a8;">Includes C2 check-ins, data uploads and web-shell traffic to internal servers.</p>
+      </html>
+      <table>
+        <search>
+          <query>index=zeek sourcetype="bro:http:json" $search$ method=POST
+| spath output=http_host path=host
+| eval nets=mvappend("192.0.2.0/32=unused", split($nets|s$, ",")), ign=mvappend("192.0.2.0/32", split($ignore|s$, ","))
+| $enrich$
+| search $direction$
+| fillnull value="-" http_host uri user_agent
+| stats count sum(request_body_len) AS bytes_up latest(_time) AS last_seen BY dir src dest http_host uri user_agent
+| sort - bytes_up
+| eval KB_up=round(bytes_up/1024, 1), last_seen=strftime(last_seen, "%Y-%m-%d %H:%M:%S")
+| table last_seen dir src dest http_host uri user_agent count KB_up</query>
+          <earliest>$range$</earliest>
+          <latest>now</latest>
+        </search>
+        <option name="count">10</option>
+        <option name="wrap">true</option>
+        <option name="drilldown">cell</option>
+        <option name="refresh.display">progressbar</option>
+        <drilldown>
+          <condition field="src"><eval token="form.search">replace($click.value2|s$, " .*", "")</eval></condition>
+          <condition field="dest"><eval token="form.search">replace($click.value2|s$, " .*", "")</eval></condition>
+        </drilldown>
+      </table>
+    </panel>
+  </row>
+
+  <!-- =============================== DNS ================================ -->
+  <!-- Not direction-filtered: internal hosts usually query an internal resolver,
+       but the names they look up are what matter. -->
+  <row>
+    <panel>
+      <title>Least-common DNS names looked up - $range_label$</title>
+      <html>
+        <p style="margin:0; font-size:12px; color:#9ea3a8;">Reverse lookups and .local are excluded. Not filtered by direction, since most hosts query an internal resolver.</p>
+      </html>
+      <table>
+        <search>
+          <query>index=zeek sourcetype="bro:dns:json" $search$ query=* NOT query IN ("*.in-addr.arpa", "*.ip6.arpa", "*.local")
+| eval nets=mvappend("192.0.2.0/32=unused", split($nets|s$, ",")), ign=mvappend("192.0.2.0/32", split($ignore|s$, ","))
+| $enrich$
+| fillnull value="-" qtype_name
+| stats count values(qtype_name) AS type values(src) AS src BY query
+| sort count
+| head 15</query>
+          <earliest>$range$</earliest>
+          <latest>now</latest>
+        </search>
+        <option name="count">15</option>
+        <option name="wrap">true</option>
+        <option name="drilldown">cell</option>
+        <option name="refresh.display">progressbar</option>
+        <drilldown>
+          <condition field="src"><eval token="form.search">replace($click.value2|s$, " .*", "")</eval></condition>
+          <condition field="query"><set token="form.search">$click.value2|s$</set></condition>
+        </drilldown>
+      </table>
+    </panel>
+    <panel>
+      <title>Possible DNS tunnelling: domains with > 50 unique subdomains or names > 60 chars - $range_label$</title>
+      <html>
+        <p style="margin:0; font-size:12px; color:#9ea3a8;">Data hidden in DNS lookups shows up as lots of long, random-looking subdomains under one domain. CDNs can also appear here.</p>
+      </html>
+      <table>
+        <search>
+          <query>index=zeek sourcetype="bro:dns:json" $search$ query=* NOT query IN ("*.in-addr.arpa", "*.ip6.arpa", "*.local")
+| eval nets=mvappend("192.0.2.0/32=unused", split($nets|s$, ",")), ign=mvappend("192.0.2.0/32", split($ignore|s$, ","))
+| $enrich$
+| rex field=query "(?&lt;domain&gt;[^.]+\.[^.]+)$$"
+| eval qlen=len(query)
+| stats count dc(query) AS unique_names max(qlen) AS max_len values(src) AS src BY domain
+| where unique_names &gt; 50 OR max_len &gt; 60
+| sort - unique_names</query>
+          <earliest>$range$</earliest>
+          <latest>now</latest>
+        </search>
+        <option name="count">10</option>
+        <option name="wrap">true</option>
+        <option name="drilldown">cell</option>
+        <option name="refresh.display">progressbar</option>
+        <drilldown>
+          <condition field="src"><eval token="form.search">replace($click.value2|s$, " .*", "")</eval></condition>
+          <condition field="domain"><set token="form.search">$click.value2|s$</set></condition>
+        </drilldown>
+      </table>
+    </panel>
+    <panel>
+      <title>Hosts getting the most 'domain does not exist' (NXDOMAIN) replies - $range_label$</title>
+      <html>
+        <p style="margin:0; font-size:12px; color:#9ea3a8;">Malware cycling through generated domains (DGA) causes bursts of these. Typos and misconfigurations cause small numbers.</p>
+      </html>
+      <table>
+        <search>
+          <query>index=zeek sourcetype="bro:dns:json" $search$ rcode_name=NXDOMAIN
+| eval nets=mvappend("192.0.2.0/32=unused", split($nets|s$, ",")), ign=mvappend("192.0.2.0/32", split($ignore|s$, ","))
+| $enrich$
+| stats count AS nxdomain dc(query) AS unique_queries latest(query) AS last_query BY src
+| sort - nxdomain
+| head 10</query>
+          <earliest>$range$</earliest>
+          <latest>now</latest>
+        </search>
+        <option name="count">10</option>
+        <option name="wrap">true</option>
+        <option name="drilldown">cell</option>
+        <option name="refresh.display">progressbar</option>
+        <drilldown>
+          <condition field="src"><eval token="form.search">replace($click.value2|s$, " .*", "")</eval></condition>
+        </drilldown>
+      </table>
+    </panel>
+  </row>
+
+  <!-- ============================ TLS / HTTP / ZEEK ============================ -->
+  <row>
+    <panel>
+      <title>Least-common TLS/HTTPS server names contacted - $range_label$</title>
+      <html>
+        <p style="margin:0; font-size:12px; color:#9ea3a8;">'(no SNI)' = an encrypted connection straight to an IP with no hostname, which is common for malware.</p>
+      </html>
+      <table>
+        <search>
+          <query>index=zeek sourcetype="bro:ssl:json" $search$
+| eval nets=mvappend("192.0.2.0/32=unused", split($nets|s$, ",")), ign=mvappend("192.0.2.0/32", split($ignore|s$, ","))
+| $enrich$
+| search $direction$
+| eval server_name=coalesce(server_name, "(no SNI) ".dest_ip)
+| stats count values(dir) AS dir values(src) AS src BY server_name
+| sort count
+| head 10</query>
+          <earliest>$range$</earliest>
+          <latest>now</latest>
+        </search>
+        <option name="count">10</option>
+        <option name="wrap">true</option>
+        <option name="drilldown">cell</option>
+        <option name="refresh.display">progressbar</option>
+        <drilldown>
+          <condition field="src"><eval token="form.search">replace($click.value2|s$, " .*", "")</eval></condition>
+        </drilldown>
+      </table>
+    </panel>
+    <panel>
+      <title>Least-common HTTP referrers (page that linked to the request) - $range_label$</title>
+      <table>
+        <search>
+          <query>index=zeek sourcetype="bro:http:json" $search$ referrer=*
+| eval nets=mvappend("192.0.2.0/32=unused", split($nets|s$, ",")), ign=mvappend("192.0.2.0/32", split($ignore|s$, ","))
+| $enrich$
+| search $direction$
+| stats count values(src) AS src BY referrer
+| sort count
+| head 10</query>
+          <earliest>$range$</earliest>
+          <latest>now</latest>
+        </search>
+        <option name="count">10</option>
+        <option name="wrap">true</option>
+        <option name="drilldown">cell</option>
+        <option name="refresh.display">progressbar</option>
+        <drilldown>
+          <condition field="src"><eval token="form.search">replace($click.value2|s$, " .*", "")</eval></condition>
+        </drilldown>
+      </table>
+    </panel>
+    <panel>
+      <title>Least-common Zeek 'weird' protocol anomalies - $range_label$</title>
+      <html>
+        <p style="margin:0; font-size:12px; color:#9ea3a8;">Malformed or unusual traffic that Zeek couldn't parse normally, e.g. evasion attempts or odd tools.</p>
+      </html>
+      <table>
+        <search>
+          <query>index=zeek sourcetype="bro:weird:json" $search$
+| eval nets=mvappend("192.0.2.0/32=unused", split($nets|s$, ",")), ign=mvappend("192.0.2.0/32", split($ignore|s$, ","))
+| $enrich$
+| stats count values(src) AS src BY name
+| sort count
+| head 10</query>
+          <earliest>$range$</earliest>
+          <latest>now</latest>
+        </search>
+        <option name="count">10</option>
+        <option name="wrap">true</option>
+        <option name="drilldown">cell</option>
+        <option name="refresh.display">progressbar</option>
+        <drilldown>
+          <condition field="src"><eval token="form.search">replace($click.value2|s$, " .*", "")</eval></condition>
+        </drilldown>
+      </table>
+    </panel>
+  </row>
+</form>
